@@ -97,6 +97,13 @@ These results were recorded on September 14, 2026, against upstream base
 red image "orange" in a two-image prompt. Token parity measures equivalent
 execution, not visual accuracy.
 
+On September 16, the strict reference, all 11 fresh-reference checkpoint tests,
+and all 12 HTTP checks passed again after refreshing onto upstream
+`176bad62480f028baee714292925bffabb2ef50b`. The reference consumed all 1,037
+tensors and preserved every earlier prompt and output token. HTTP serving
+shut down with exit code zero. The standalone async lifecycle results above
+remain from September 14.
+
 The synthetic image recipes, messages, checkpoint hashes, and reference pins
 are in [`tests/fixtures/nano_vl_v2_cases.json`](../tests/fixtures/nano_vl_v2_cases.json).
 There are no frozen expected output tokens. The opt-in test generates a fresh
