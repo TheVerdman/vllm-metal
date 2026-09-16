@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import platform
+from importlib.machinery import SourceFileLoader
 from importlib.metadata import version
 from pathlib import Path
 
@@ -41,9 +42,15 @@ def make_images(case: dict, fixture: dict) -> list:
 def load_processor(source: Path, expected_sha256: str):
     if sha256(source) != expected_sha256:
         raise ValueError("NVIDIA processor source hash does not match the pin")
-    spec = importlib.util.spec_from_file_location("nvidia_vl_v2_reference", source)
+    # HF snapshot symlinks resolve to content-addressed blobs without a suffix.
+    # Select the Python loader explicitly, after checking the source hash.
+    spec = importlib.util.spec_from_file_location(
+        "nvidia_vl_v2_reference",
+        source,
+        loader=SourceFileLoader("nvidia_vl_v2_reference", str(source)),
+    )
     if spec is None or spec.loader is None:
-        raise ValueError("NVIDIA processor source must be a Python file")
+        raise ValueError("Cannot load the verified NVIDIA processor source")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from tools.nano_vl_reference import greedy_tokens, load_processor
+from tools.nano_vl_reference import greedy_tokens, load_processor, sha256
 
 
 def test_unpinned_processor_is_rejected_before_execution(tmp_path):
@@ -14,6 +14,17 @@ def test_unpinned_processor_is_rejected_before_execution(tmp_path):
     source.write_text("raise RuntimeError('unverified source executed')\n")
     with pytest.raises(ValueError, match="source hash"):
         load_processor(source, "0" * 64)
+
+
+def test_verified_processor_loads_from_resolved_hf_cache_blob(tmp_path):
+    blob = tmp_path / "3d33d65e780377f858600b72e1838169e49df643"
+    blob.write_text("processor_identity = 'verified-source'\n")
+    snapshot_file = tmp_path / "image_processing.py"
+    snapshot_file.symlink_to(blob)
+
+    processor = load_processor(snapshot_file.resolve(), sha256(blob))
+
+    assert processor.processor_identity == "verified-source"
 
 
 def test_reference_resets_hybrid_cache_and_passes_pixels_only_on_prefill():
