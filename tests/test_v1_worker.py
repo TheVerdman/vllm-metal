@@ -111,7 +111,9 @@ def _make_worker(model_runner: object) -> MetalWorker:
     worker = MetalWorker.__new__(MetalWorker)
     worker.model_runner = model_runner  # type: ignore[assignment]
     worker.metal_config = MetalConfig(mlx_device="gpu")
-    worker.cache_config = SimpleNamespace(block_size=16, gpu_memory_utilization=0.92)
+    worker.cache_config = SimpleNamespace(
+        block_size=16, gpu_memory_utilization=0.92, kv_cache_memory_bytes=None
+    )
     worker.vllm_config = SimpleNamespace(cache_config=worker.cache_config)
     return worker
 
@@ -196,6 +198,33 @@ class TestWorkerRunnerBoundaryDelegation:
 
 
 class TestPagedAttentionPlanDiagnostics:
+    @pytest.mark.parametrize(
+        ("explicit_budget", "expected_budget"),
+        [(1_000_000_000, 1_000_000_000), (9_000_000_000, 3_306_800_000)],
+    )
+    def test_explicit_kv_cap_preserves_hybrid_headroom(
+        self, monkeypatch, explicit_budget, expected_budget
+    ) -> None:
+        runner = SimpleNamespace(
+            is_hybrid=True,
+            scheduler_config=SimpleNamespace(max_num_seqs=2),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
+            linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+        planner = self._make_planner(
+            runner, gpu_memory_utilization=0.5, per_block_bytes=10_000_000
+        )
+        planner._worker.cache_config.kv_cache_memory_bytes = explicit_budget
+        monkeypatch.setattr(planner, "_metal_limit_bytes", lambda: 10_000_000_000)
+        monkeypatch.setattr(planner, "get_model_memory_usage", lambda: 1_000_000_000)
+
+        plan = planner._paged_attention_plan(overhead=500_000_000)
+
+        assert plan.kv_budget == expected_budget
+        assert plan.num_blocks * plan.per_block_bytes <= explicit_budget
+        assert plan.hybrid_gdn_reservation.total_bytes == 193_200_000
+
     def _make_planner(
         self,
         model_runner: object,

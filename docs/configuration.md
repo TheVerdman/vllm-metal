@@ -49,6 +49,16 @@ model pairing, and memory considerations.
 
 ## KV Cache Memory Settings
 
+`--kv-cache-memory-bytes` can further cap the paged KV pool. On Metal, this
+is an additional ceiling within `--gpu-memory-utilization`; it does not
+override the unified-memory budget or the reserved hybrid-state headroom.
+The allocation is rounded down to whole cache blocks.
+
+By default, startup raises MLX's wired-memory limit to the device's recommended
+working-set size. Set `VLLM_METAL_DISABLE_WIRED_LIMIT=1` to preserve the existing
+MLX limit instead. This controls memory pinning; it does not replace the engine's
+`--gpu-memory-utilization` budget.
+
 The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
 flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.

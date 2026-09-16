@@ -1214,6 +1214,16 @@ class WorkerCachePlanner:
         reservation = self._hybrid_gdn_reservation()
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
         kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
+        explicit_kv_budget = self._worker.vllm_config.cache_config.kv_cache_memory_bytes
+        if explicit_kv_budget is not None:
+            # Keep the unified-memory budget and hybrid growth reservations
+            # while allowing a smaller explicitly bounded KV pool.
+            kv_budget = min(kv_budget, explicit_kv_budget)
+            logger.info(
+                "Paged attention: applying --kv-cache-memory-bytes=%d "
+                "within the Metal memory budget",
+                explicit_kv_budget,
+            )
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
