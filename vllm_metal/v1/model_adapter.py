@@ -995,6 +995,16 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 PaddleOCRVLMultimodalAdapter.from_loaded_model(model),
             )
 
+        if "NemotronH_Nano_VL_V2" in architectures:
+            from vllm_metal.multimodal.nemotron_nano_vl import (
+                NemotronNanoVLImageAdapter,
+            )
+
+            return cast(
+                MultimodalRuntimeAdapter,
+                NemotronNanoVLImageAdapter.from_loaded_model(model),
+            )
+
         return None
 
     def build_yoco_cache_mapping(

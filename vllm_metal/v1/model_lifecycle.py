@@ -29,6 +29,9 @@ from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
 )
+from vllm_metal.v1.mlx_vlm_paths import (
+    mlx_vlm_compatible_model_path as _mlx_vlm_compatible_model_path,
+)
 from vllm_metal.v1.mm import EncoderCache
 from vllm_metal.v1.model_adapter import ModelAdapter
 from vllm_metal.v1.pooling.backends.decoder.factory import (
@@ -406,9 +409,14 @@ class ModelLifecycle:
 
         elif is_vlm:
             load_label = "MLX-VLM model"
-            model, tokenizer = mlx_vlm_load(
-                model_name, lazy=lazy_weights, revision=revision
-            )
+            with _mlx_vlm_compatible_model_path(
+                model_name,
+                hf_config=getattr(model_config, "hf_config", None),
+                revision=revision,
+            ) as compatible_model_name:
+                model, tokenizer = mlx_vlm_load(
+                    str(compatible_model_name), lazy=lazy_weights, revision=revision
+                )
 
         elif awq_loader is not None:
             load_label = "AWQ model"

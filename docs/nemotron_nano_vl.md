@@ -1,0 +1,128 @@
+# Nemotron Nano VL V2
+
+Nano VL V2 accepts images and produces text through the paged Nemotron-H
+runtime. The model-owned adapter runs MLX-VLM's vision encoder and projector,
+then passes their output to the existing text runtime. Audio, video, and
+precomputed image embeddings receive validation errors. Omni support requires
+its own adapter and processor contract.
+
+## Checkpoint and preprocessing
+
+The validated checkpoint is `ekryski/Nemotron-Nano-12B-v2-VL-4bit`, revision
+`e47ef857c31650d807610d810be199a20d9bf114`. Its 1,037 tensors load strictly:
+641 language tensors, 389 vision tensors, and seven projector tensors. No
+checkpoint tensors are discarded and no model parameters are left unfilled.
+
+MLX-VLM 0.6.8 calls the matching model implementation `nemotron_h_nano_omni`.
+A temporary configuration view supplies that alias and disables its separate
+video patch projection, which the image checkpoint does not contain. The
+loader makes MLX-VLM honor its existing `separate_video_embedder=False` flag.
+The original checkpoint files remain unchanged; ordinary Omni configurations
+retain their video projection.
+
+Image preparation follows NVIDIA's static VL V2 processor, pinned at
+`nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` revision
+`ca9543b126e8bf3176916d3d305ccc415f89fd4d`. Pixels are rescaled before bicubic
+tensor resizing, split into 512-pixel tiles, and followed by a thumbnail when
+there is more than one tile. Normalization precedes conversion to BF16.
+Each tile produces 256 image embeddings. The `<img>` and `</img>` markers stay
+as text embeddings; only their enclosed image positions receive visual rows,
+including when a prefill chunk divides that range.
+
+The generic Omni processor uses different image geometry. Successful loading
+through the Omni model class does not make that processor a VL V2 reference.
+Dynamic-resolution configurations are rejected by this image adapter.
+
+Transformers 5.17.0 can emit a Mistral tokenizer-regex warning for this export
+because its configuration omits `transformers_version`. The pinned tokenizer
+already contains the exact regex suggested by that correction. The warning
+does not require changing this checkpoint's tokenizer.
+
+## Bounded serving example
+
+Use a local copy of the pinned checkpoint with:
+
+```bash
+MLX_ENABLE_TF32=1 VLLM_METAL_DISABLE_WIRED_LIMIT=1 \
+  vllm serve /path/to/Nemotron-Nano-12B-v2-VL-4bit \
+  --host 127.0.0.1 --served-model-name nano-vl-v2 \
+  --max-model-len 2048 --max-num-seqs 2 --max-num-batched-tokens 512 \
+  --gpu-memory-utilization 0.5 --kv-cache-memory-bytes 1073741824 \
+  --no-enable-prefix-caching --enforce-eager --generation-config vllm \
+  --limit-mm-per-prompt '{"image":2}' \
+  --mm-processor-kwargs '{"max_num_tiles":2}'
+```
+
+Send standard `/v1/chat/completions` messages containing `text` and `image_url`
+content parts. Images can use data URLs. For reproducible greedy comparisons,
+set `temperature=0`, `seed=0`, and `max_tokens=32`. vLLM's `return_token_ids=true`
+request extension exposes the prompt and generated IDs for comparison.
+
+The example caps the KV pool at 1 GiB within the overall memory budget.
+Two tiles plus a thumbnail consume 768 image positions. The tile and image
+limits must fit the complete text-and-image context. These settings describe
+the checked workload, not performance tuning or a guarantee for smaller hosts.
+
+## Regression evidence
+
+The pinned direct reference uses MLX-VLM 0.6.8, MLX 0.32.1, and NVIDIA's
+independently loaded image processor on an Apple M5 Pro with 64 GB memory,
+macOS 26.6.2, and Python 3.12.12. The reference uses the loader adjustment
+described above, but does not call the Metal adapter, Metal processor, or
+paged runtime. Each case uses a fresh hybrid cache and greedy decoding.
+The reference explicitly pins `MLX_ENABLE_TF32=1`, MLX's default math mode.
+Changing this setting can change exact greedy tokens on M5: with TF32 disabled,
+one tiled case produced `Red` where the pinned reference produced `red`.
+The parity test starts a fresh reference process and engine with the same setting,
+because MLX reads it once per process. It restores the surrounding test
+environment afterward; ordinary unit tests keep their strict FP32 setting.
+
+Paged Python serving reproduced every prompt ID and generated ID, including
+EOS, for eight cases: text only, square, resized, wide tiled, portrait tiled,
+two images, reversed images, and multi-turn image history. Three pairs also
+matched with two simultaneous requests. Separate async checks exercised
+explicit cancellation, generator closure, recovery, request-state cleanup,
+and rejection of audio, video, and precomputed image embeddings.
+
+Normal HTTP serving reproduced all eight cases in one uninterrupted server
+session, including prompt/output IDs and usage accounting. The same run
+verified streaming token IDs including EOS, usage and terminal events, client
+disconnect/recovery, structured HTTP 400 responses for unsupported audio and
+excess images, and recovery after both errors. All 12 checks passed using the
+normal CLI and enabled adapter, with clean startup and shutdown. Earlier
+interrupted attempts remain recorded separately in the evidence.
+
+These results were recorded on September 14, 2026, against upstream base
+`bc9bd16f8156e38f6e2c7143d6964090b2dcaf8b`. One reference answer called the
+red image "orange" in a two-image prompt. Token parity measures equivalent
+execution, not visual accuracy.
+
+The synthetic image recipes, messages, checkpoint hashes, and reference pins
+are in [`tests/fixtures/nano_vl_v2_cases.json`](../tests/fixtures/nano_vl_v2_cases.json).
+There are no frozen expected output tokens. The opt-in test generates a fresh
+direct MLX-VLM reference for all eight cases, exits that process, and then
+compares the paged engine with it, including three concurrent pairs. Every
+prompt ID and generated ID must match exactly, including EOS; a top-K
+alternative is not accepted. The reference JSON and log remain in pytest's
+temporary output directory for inspection.
+
+After checking host headroom and obtaining the local checkpoint, the opt-in
+test is:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_METAL_DISABLE_WIRED_LIMIT=1 \
+  NEMOTRON_NANO_VL_PARITY_MODEL=/path/to/Nemotron-Nano-12B-v2-VL-4bit \
+  NEMOTRON_NANO_VL_PROCESSOR_SOURCE=/path/to/pinned/image_processing.py \
+  pytest -q tests/multimodal/test_nemotron_nano_vl_parity.py
+```
+
+Obtain `image_processing.py` from the pinned NVIDIA revision above. The test
+verifies its SHA-256 before importing it and verifies the checkpoint hashes
+before loading. It downloads no weights and checks the normal enabled adapter
+without a validation-only override. The reference uses the same input
+preparation and greedy loop as the separately recorded capsule and tensor
+inventory validation. Its only shared runtime dependency is the loader view;
+it does not call the Metal adapter or processor.
+Run `pytest -m 'not slow' tests/multimodal` for checkpoint-free regression
+coverage. Other checkpoints, quantizations, longer contexts, and performance
+require separate evidence.
