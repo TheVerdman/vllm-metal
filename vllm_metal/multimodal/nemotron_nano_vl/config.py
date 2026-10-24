@@ -12,6 +12,19 @@ from typing import Any
 from transformers import PretrainedConfig
 
 
+def image_tile_limit(mm_config: Any = None) -> int:
+    """The server's tile ceiling, shared by admission and encoder profiling."""
+    from vllm.transformers_utils.processors.nano_nemotron_vl import DEFAULT_NUM_TILES
+
+    kwargs = mm_config.merge_mm_processor_kwargs({}) if mm_config is not None else {}
+    limit = kwargs.get("max_num_tiles")
+    if limit is None:
+        limit = DEFAULT_NUM_TILES
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("Nano VL V2 max_num_tiles must be a positive integer.")
+    return limit
+
+
 class NemotronNanoVLConfig(PretrainedConfig):
     model_type = "NemotronH_Nano_VL_V2"
     is_composition = True

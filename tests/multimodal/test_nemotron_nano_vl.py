@@ -25,7 +25,9 @@ _HIDDEN = 8
 
 class _LanguageModel:
     def __init__(self) -> None:
-        self.backbone = SimpleNamespace(layers=[object()])
+        self.backbone = SimpleNamespace(
+            layers=[object()], embeddings=self.get_input_embeddings
+        )
         self.calls: list[dict[str, Any]] = []
 
     def get_input_embeddings(self, input_ids: mx.array) -> mx.array:
@@ -52,6 +54,7 @@ class _Model:
             text_config=SimpleNamespace(hidden_size=_HIDDEN),
             vision_config=SimpleNamespace(patch_size=16),
             downsample_ratio=0.5,
+            force_image_size=32,
             img_context_token_id=_IMAGE_TOKEN,
         )
         patch_generator = SimpleNamespace(
@@ -68,7 +71,7 @@ class _Model:
         self.pixels_seen: list[mx.array] = []
         self.composite_calls = 0
 
-    def extract_feature(self, pixels: mx.array) -> mx.array:
+    def _extract_feature_single(self, pixels: mx.array) -> mx.array:
         self.pixels_seen.append(pixels)
         rows_per_tile = (pixels.shape[-2] // 32) * (pixels.shape[-1] // 32)
         return mx.ones(
@@ -408,9 +411,62 @@ def test_nano_attention_contract_is_position_free() -> None:
     assert attention_contract_for(attention_cls()).use_rope is False
 
 
+@pytest.mark.parametrize(
+    "max_tiles,thumbnail,images,expected",
+    [
+        (None, True, 2, 13),
+        (2, True, 2, 3),
+        (16, True, 1, 17),
+        (16, False, 1, 16),
+        (1, True, 1, 1),
+        (2, True, 0, 0),
+    ],
+)
+def test_profile_matches_configured_image_limits(
+    max_tiles, thumbnail, images, expected
+):
+    from vllm.config.multimodal import MultiModalConfig
+
+    mm_config = MultiModalConfig(
+        limit_per_prompt={"image": images},
+        mm_processor_kwargs={"max_num_tiles": max_tiles},
+    )
+    adapter = DefaultModelAdapter().build_multimodal_adapter(
+        _Model(),
+        SimpleNamespace(
+            architectures=["NemotronH_Nano_VL_V2"], use_thumbnail=thumbnail
+        ),
+        model_config=SimpleNamespace(multimodal_config=mm_config),
+    )
+    encoded = adapter.encode_multimodal(adapter.profile_features())
+    assert [item.hidden_states.shape for item in encoded] == (
+        [(expected, _HIDDEN)] if expected else []
+    )
+
+
+def test_encoding_cannot_mutate_cached_torch_pixels(monkeypatch):
+    model = _Model()
+    pixels = torch.ones((1, 3, 32, 32))
+    original = pixels.clone()
+    feature = replace(
+        _feature(height=32), data=_item({"pixel_values_flat": pixels}, tiles=1)
+    )
+    encode = model._extract_feature_single
+
+    def consume(pixels):
+        pixels[0, 0, 0, 0] = 99
+        mx.eval(pixels)
+        return encode(pixels)
+
+    monkeypatch.setattr(model, "_extract_feature_single", consume)
+    adapter = NemotronNanoVLImageAdapter.from_loaded_model(model)
+    mx.eval(adapter.encode_multimodal([feature])[0].hidden_states)
+    assert torch.equal(pixels, original)
+
+
 @pytest.fixture
 def tiny_nano_model() -> tuple[Any, Any]:
-    """A randomly initialized, weight-free Nano model from mlx-vlm 0.6.8+."""
+    """A randomly initialized, weight-free Nano model from the pinned mlx-vlm."""
     pytest.importorskip("mlx_vlm.models.nemotron_h.language")
     from mlx_vlm.models.nemotron_h_nano_omni.config import (
         ModelConfig,
@@ -451,6 +507,9 @@ def tiny_nano_model() -> tuple[Any, Any]:
             max_resolution=32,
             patch_size=16,
         ),
+        model_type="NemotronH_Nano_VL_V2",
+        force_image_size=32,
+        ps_version="v2",
         downsample_ratio=0.5,
         projector_hidden_size=64,
         vit_hidden_size=16,
@@ -519,6 +578,61 @@ def test_tiny_real_mlx_vlm_model_matches_decomposed_image_forward(
     assert mx.allclose(adapter_output.logits, direct_output.logits).item()
 
 
+def test_tiny_quantized_projector_preserves_direct_pixel_precision(tiny_nano_model):
+    import mlx.nn as nn
+
+    model, _ = tiny_nano_model
+    model.set_dtype(mx.bfloat16)
+    nn.quantize(model.mlp1, group_size=32, bits=4)
+    assert model.mlp1.layers[1].weight.dtype == mx.uint32
+    pixels = torch.linspace(-1, 1, 3 * 32 * 32).reshape(1, 3, 32, 32)
+    feature = replace(
+        _feature(height=32), data=_item({"pixel_values_flat": pixels}, tiles=1)
+    )
+    adapter = NemotronNanoVLImageAdapter.from_loaded_model(model)
+    direct = model.extract_feature(mx.array(pixels.numpy())).reshape(1, -1)
+    actual = adapter.encode_multimodal([feature])[0].hidden_states
+    assert mx.array_equal(actual, direct).item()
+
+
+def test_tiny_vision_profiles_thirteen_tiles(tiny_nano_model):
+    # PR #1160's maximal-image regression, using our existing tiny model.
+    model, _ = tiny_nano_model
+    adapter = NemotronNanoVLImageAdapter.from_loaded_model(model)
+    (encoded,) = adapter.encode_multimodal(adapter.profile_features())
+    assert encoded.hidden_states.shape == (13, 32)
+
+
+@pytest.mark.parametrize("model_type", ["NemotronH_Nano_VL_V2", "nemotron_h_nano_omni"])
+@pytest.mark.parametrize("omit", [None, "video_embedder.weight", "embedder.weight"])
+def test_nano_compat_strict_loading_does_not_hide_missing_omni_weights(
+    tiny_nano_model, model_type, omit
+):
+    from mlx.utils import tree_flatten
+
+    from vllm_metal.compat import _patch_mlx_vlm_nemotron_nano_vl_v2
+
+    _patch_mlx_vlm_nemotron_nano_vl_v2()
+    model, config = tiny_nano_model
+    config.model_type = model_type
+    prefix = "vision_model.radio_model.model.patch_generator."
+    weights = dict(tree_flatten(model.parameters()))
+    if omit is not None:
+        del weights[prefix + omit]
+    sanitized = model.sanitize(weights)
+    allowed = omit is None or (
+        model_type == "NemotronH_Nano_VL_V2" and omit == "video_embedder.weight"
+    )
+    if allowed:
+        model.load_weights(list(sanitized.items()), strict=True)
+        assert (
+            "video_embedder" in model.vision_model.radio_model.model.patch_generator
+        ) == (omit is None)
+    else:
+        with pytest.raises(ValueError, match=omit):
+            model.load_weights(list(sanitized.items()), strict=True)
+
+
 def test_tiny_real_nano_hybrid_layers_accept_paged_wrappers(
     tiny_nano_model: tuple[Any, Any],
 ) -> None:
@@ -541,13 +655,11 @@ def test_tiny_real_nano_hybrid_layers_accept_paged_wrappers(
         hybrid_plan=build_hybrid_runtime_plan(
             vars(config.text_config), 2, (torch.float32, torch.float32)
         ),
-        max_num_seqs=2,
-        num_kv_heads=2,
-        head_dim=8,
-        block_size=8,
         dtype=mx.float32,
     )
-    runtime.initialize(num_blocks=4)
+    from tests.stub_runner import initialize_hybrid_runtime
+
+    initialize_hybrid_runtime(runtime, 4, block_size=8, num_kv_heads=2, head_dim=8)
     assert runtime.patch_model(model) == 2
     assert isinstance(model.language_model.layers[0].mixer, Mamba2PagedStateWrapper)
     assert isinstance(model.language_model.layers[1].mixer, SDPAPagedAttentionWrapper)
@@ -559,7 +671,7 @@ def test_tiny_nano_mamba_state_follows_requests_through_reorder_and_reuse(
     """Exercise the VLM's real mixer with upstream's per-request state pool."""
     from mlx_vlm.models.cache import ArraysCache
 
-    from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+    from tests.stub_runner import make_state_cache
     from vllm_metal.attention.context import (
         PagedAttentionContext,
         clear_context,
@@ -569,10 +681,9 @@ def test_tiny_nano_mamba_state_follows_requests_through_reorder_and_reuse(
 
     model, _ = tiny_nano_model
     mixer = model.language_model.layers[0].mixer
-    pool = GDNPagedStateCache(
+    pool = make_state_cache(
         num_layers=1,
         max_seqs=2,
-        initial_seqs=2,
         conv_kernel_dim=mixer.conv_kernel_size,
         conv_dim=mixer.conv_dim,
         num_v_heads=mixer.num_heads,
@@ -624,7 +735,7 @@ def test_tiny_nano_mamba_state_follows_requests_through_reorder_and_reuse(
         assert_state(1, reference, 1)
 
         # Simulate the runtime releasing one request slot for a new prompt.
-        pool.reset_slot(1)
+        pool.zero_slots([1], [0])
         fresh = mx.random.normal((1, 4, 32))
         fresh_cache = ArraysCache(size=2)
         fresh_ref = mixer(fresh, mask=None, cache=fresh_cache)

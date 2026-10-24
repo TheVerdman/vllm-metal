@@ -204,8 +204,8 @@
       "MLX_ENABLE_TF32": "1"
     },
     "implementation": "mlx-vlm-direct-with-pinned-nvidia-vl-v2-preprocessing",
-    "mlx": "0.32.1",
-    "mlx_vlm": "0.6.8",
+    "mlx": "0.32.4",
+    "mlx_vlm": "0.7.6",
     "nvidia_processor_revision": "ca9543b126e8bf3176916d3d305ccc415f89fd4d",
     "nvidia_processor_sha256": "c9a186c2c272de9e9e56e192663fbaa2e7b4543bb871051f53a686be400b9f6d"
   },

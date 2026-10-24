@@ -68,7 +68,6 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
         post_norm_query_scale=True,
         sigmoid_output_gate=True,
     ),
-
     "mlx_vlm.models.nemotron_h.language": AttentionContract(use_rope=False),
 }
 

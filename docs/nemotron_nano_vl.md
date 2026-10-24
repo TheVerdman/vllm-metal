@@ -6,19 +6,32 @@ then passes their output to the existing text runtime. Audio, video, and
 precomputed image embeddings receive validation errors. Omni support requires
 its own adapter and processor contract.
 
+The October 23 refresh targets upstream `f0812a6b679ce6afbe4cb5120d53be35ad625cc9`
+with MLX 0.32.4 and MLX-VLM 0.7.6. Offline adapter, loader, preprocessing,
+profiling, and hybrid-cache regressions have been rerun. Trained-checkpoint,
+HTTP, and async lifecycle validation have not been rerun on this revision
+because the local host does not meet the documented run guards. The trained
+results below remain historical evidence for the September source.
+
 ## Checkpoint and preprocessing
 
-The validated checkpoint is `ekryski/Nemotron-Nano-12B-v2-VL-4bit`, revision
-`e47ef857c31650d807610d810be199a20d9bf114`. Its 1,037 tensors load strictly:
+The reference checkpoint is `ekryski/Nemotron-Nano-12B-v2-VL-4bit`, revision
+`e47ef857c31650d807610d810be199a20d9bf114`. September strict loading consumed 1,037 tensors:
 641 language tensors, 389 vision tensors, and seven projector tensors. No
 checkpoint tensors are discarded and no model parameters are left unfilled.
 
-MLX-VLM 0.6.8 calls the matching model implementation `nemotron_h_nano_omni`.
-A temporary configuration view supplies that alias and disables its separate
-video patch projection, which the image checkpoint does not contain. The
-loader makes MLX-VLM honor its existing `separate_video_embedder=False` flag.
-The original checkpoint files remain unchanged; ordinary Omni configurations
-retain their video projection.
+MLX-VLM 0.7.6 calls the matching model implementation `nemotron_h_nano_omni`.
+The compatibility layer maps the V2 model type and processor without changing
+checkpoint files. Its sanitizer removes an unshipped video projection only
+for V2 checkpoints; incomplete unrelated Omni checkpoints still fail strict
+loading, and a shipped video projection is retained. A local configuration
+reader handles MLX exports that omit NVIDIA's Python config files, without
+requiring `trust_remote_code`.
+
+The loader mapping, current MLX-VLM interfaces, encoder profiling, and cached
+tensor copy handling incorporate ideas from syang-genai's
+[PR #1160](https://github.com/vllm-project/vllm-metal/pull/1160), commit
+`96ba69519bd7c3d8ce83591fa31c33b3a29223d7`.
 
 Image preparation follows NVIDIA's static VL V2 processor, pinned at
 `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` revision
@@ -33,21 +46,21 @@ The generic Omni processor uses different image geometry. Successful loading
 through the Omni model class does not make that processor a VL V2 reference.
 Dynamic-resolution configurations are rejected by this image adapter.
 
-Transformers 5.17.0 can emit a Mistral tokenizer-regex warning for this export
-because its configuration omits `transformers_version`. The pinned tokenizer
-already contains the exact regex suggested by that correction. The warning
-does not require changing this checkpoint's tokenizer.
+Encoder profiling follows the server's configured `max_num_tiles`, including
+the thumbnail. Per-request overrides cannot exceed that ceiling. Disabling
+image inputs also disables encoder profiling. Processor pixel precision is
+preserved, including when projector weights use packed quantized storage.
 
 ## Bounded serving example
 
 Use a local copy of the pinned checkpoint with:
 
 ```bash
-MLX_ENABLE_TF32=1 VLLM_METAL_DISABLE_WIRED_LIMIT=1 \
+MLX_ENABLE_TF32=1 \
   vllm serve /path/to/Nemotron-Nano-12B-v2-VL-4bit \
   --host 127.0.0.1 --served-model-name nano-vl-v2 \
   --max-model-len 2048 --max-num-seqs 2 --max-num-batched-tokens 512 \
-  --gpu-memory-utilization 0.5 --kv-cache-memory-bytes 1073741824 \
+  --gpu-memory-utilization 0.5 \
   --no-enable-prefix-caching --enforce-eager --generation-config vllm \
   --limit-mm-per-prompt '{"image":2}' \
   --mm-processor-kwargs '{"max_num_tiles":2}'
@@ -58,12 +71,13 @@ content parts. Images can use data URLs. For reproducible greedy comparisons,
 set `temperature=0`, `seed=0`, and `max_tokens=32`. vLLM's `return_token_ids=true`
 request extension exposes the prompt and generated IDs for comparison.
 
-The example caps the KV pool at 1 GiB within the overall memory budget.
 Two tiles plus a thumbnail consume 768 image positions. The tile and image
 limits must fit the complete text-and-image context. These settings describe
-the checked workload, not performance tuning or a guarantee for smaller hosts.
+the intended bounded workload. They are not a performance or headroom claim.
+The local validation harness additionally uses separately maintained explicit
+KV-byte and wired-limit controls; those changes are not part of this image patch.
 
-## Regression evidence
+## Historical trained evidence and current regression checks
 
 The pinned direct reference uses MLX-VLM 0.6.8, MLX 0.32.1, and NVIDIA's
 independently loaded image processor on an Apple M5 Pro with 64 GB memory,
@@ -117,7 +131,7 @@ After checking host headroom and obtaining the local checkpoint, the opt-in
 test is:
 
 ```bash
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_METAL_DISABLE_WIRED_LIMIT=1 \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_ENABLE_MPS_FALLBACK=0 \
   NEMOTRON_NANO_VL_PARITY_MODEL=/path/to/Nemotron-Nano-12B-v2-VL-4bit \
   NEMOTRON_NANO_VL_PROCESSOR_SOURCE=/path/to/pinned/image_processing.py \
   pytest -q tests/multimodal/test_nemotron_nano_vl_parity.py
@@ -128,7 +142,7 @@ verifies its SHA-256 before importing it and verifies the checkpoint hashes
 before loading. It downloads no weights and checks the normal enabled adapter
 without a validation-only override. The reference uses the same input
 preparation and greedy loop as the separately recorded capsule and tensor
-inventory validation. Its only shared runtime dependency is the loader view;
+inventory validation. Its only shared runtime dependency is loader compatibility;
 it does not call the Metal adapter or processor.
 Run `pytest -m 'not slow' tests/multimodal` for checkpoint-free regression
 coverage. Other checkpoints, quantizations, longer contexts, and performance

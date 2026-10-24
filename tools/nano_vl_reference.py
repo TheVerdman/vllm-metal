@@ -2,7 +2,7 @@
 """Fresh Nano VL V2 greedy reference using MLX-VLM and NVIDIA preprocessing.
 
 The Metal adapter, processor, and paged runtime are intentionally not used.
-Only the checkpoint loader compatibility view is shared. All inputs must
+Only checkpoint loader compatibility is shared. All inputs must
 already be local; the processor source is verified before it is imported.
 """
 
@@ -150,12 +150,12 @@ def run_reference(model_path: Path, fixture_path: Path, source: Path, output: Pa
     from mlx_vlm import utils
     from transformers import AutoTokenizer
 
-    from vllm_metal.v1.mlx_vlm_paths import mlx_vlm_compatible_model_path
+    from vllm_metal.compat import _patch_mlx_vlm_nemotron_nano_vl_v2
 
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
         raise RuntimeError("The pinned reference requires Metal")
-    with mlx_vlm_compatible_model_path(model_path) as compatible:
-        model = utils.load_model(compatible, lazy=False, strict=True)
+    _patch_mlx_vlm_nemotron_nano_vl_v2()
+    model = utils.load_model(model_path, lazy=False, strict=True)
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, local_files_only=True, trust_remote_code=False
     )

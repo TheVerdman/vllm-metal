@@ -53,7 +53,6 @@ def test_spawned_worker_registers_nano_before_receiver_cache(tmp_path) -> None:
         from unittest.mock import patch
 
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-        from vllm.multimodal import MULTIMODAL_REGISTRY
         from vllm.platforms import current_platform
         from vllm.transformers_utils.config import _CONFIG_REGISTRY, get_config
         from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -83,8 +82,8 @@ def test_spawned_worker_registers_nano_before_receiver_cache(tmp_path) -> None:
                 worker_extension_cls="",
             ),
         )
-        with patch.object(
-            MULTIMODAL_REGISTRY, "worker_receiver_cache_from_config", check_cache
+        with patch(
+            "vllm.v1.worker.worker_base.worker_receiver_cache_from_config", check_cache
         ):
             try:
                 WorkerWrapperBase().init_worker([{

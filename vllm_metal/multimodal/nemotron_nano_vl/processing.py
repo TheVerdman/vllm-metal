@@ -29,6 +29,8 @@ from vllm.transformers_utils.processors.internvl import (
 )
 from vllm.transformers_utils.processors.nano_nemotron_vl import NanoNemotronVLProcessor
 
+from vllm_metal.multimodal.nemotron_nano_vl.config import image_tile_limit
+
 
 class NemotronNanoVLProcessor(NanoNemotronVLProcessor):
     """Use VL V2's fixed-size tiles, thumbnail, and BF16 encoder input."""
@@ -97,6 +99,8 @@ class NemotronNanoVLProcessingInfo(NanoNemotronVLProcessingInfo):
         return False
 
     def get_hf_processor(self, **kwargs: object) -> NemotronNanoVLProcessor:
+        # vLLM passes tokenizer truncation options to processor construction.
+        kwargs.pop("truncation", None)
         config = self.get_hf_config()
         if NemotronNanoVLProcessor.use_dynamic_resolution(config):
             raise ValueError(
@@ -115,6 +119,18 @@ class NemotronNanoVLMultiModalProcessor(NanoNemotronVLMultiModalProcessor):
     def apply(
         self, inputs: ProcessorInputs, timing_ctx: TimingContext
     ) -> MultiModalInput:
+        limit = image_tile_limit(self.info.ctx.get_mm_config())
+        requested = inputs.hf_processor_mm_kwargs.get("max_num_tiles")
+        if requested is not None and (
+            isinstance(requested, bool)
+            or not isinstance(requested, int)
+            or not 1 <= requested <= limit
+        ):
+            raise VLLMValidationError(
+                f"Nano VL V2 max_num_tiles must be between 1 and the configured "
+                f"limit {limit}; larger inputs were not profiled at startup.",
+                parameter="mm_processor_kwargs.max_num_tiles",
+            )
         if "image" in inputs.mm_data_items and isinstance(
             inputs.mm_data_items["image"], ImageEmbeddingItems
         ):

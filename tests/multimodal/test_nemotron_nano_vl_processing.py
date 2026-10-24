@@ -152,6 +152,35 @@ def test_full_processor_preserves_text_image_order_and_marker_masks(processor):
     assert processor.info.get_supported_mm_limits() == {"image": None}
 
 
+@pytest.mark.parametrize("requested", [0, -1, True, 1.5, 3, 13])
+def test_request_cannot_exceed_profiled_tile_limit(processor, requested):
+    with pytest.raises(VLLMValidationError, match="configured limit 2"):
+        processor.apply(
+            ProcessorInputs(
+                prompt=[1],
+                mm_data_items=processor.info.parse_mm_data(
+                    {"image": Image.new("RGB", (512, 512))}
+                ),
+                hf_processor_mm_kwargs={"max_num_tiles": requested},
+            ),
+            TimingContext(enabled=False),
+        )
+
+
+def test_request_can_reduce_tile_limit(processor):
+    output = processor.apply(
+        ProcessorInputs(
+            prompt=[1],
+            mm_data_items=processor.info.parse_mm_data(
+                {"image": Image.new("RGB", (1024, 512))}
+            ),
+            hf_processor_mm_kwargs={"max_num_tiles": 1},
+        ),
+        TimingContext(enabled=False),
+    )
+    assert output["mm_placeholders"]["image"][0].get_num_embeds() == 256
+
+
 @pytest.mark.parametrize("modality", ["audio", "video"])
 def test_unsupported_modalities_rejected_during_input_processing(processor, modality):
     data = (

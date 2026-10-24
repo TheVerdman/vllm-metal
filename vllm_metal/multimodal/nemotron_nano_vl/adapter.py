@@ -13,10 +13,11 @@ from typing import Any
 
 import mlx.core as mx
 import torch
-from vllm.multimodal.inputs import MultiModalKwargsItem
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 
-from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
-from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec, PlaceholderRange
+from vllm_metal.multimodal.nemotron_nano_vl.config import image_tile_limit
+from vllm_metal.tensor_bridge import torch_to_mlx
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class NemotronNanoVLImageAdapter:
     forward_ready: bool = True
     # Nemotron-H attention has no RoPE; the runner's normal text route is safe.
     requires_explicit_positions: bool = False
+    supplies_segment_positions: bool = False
 
     def __init__(
         self,
@@ -43,6 +45,8 @@ class NemotronNanoVLImageAdapter:
         downsample_ratio: float,
         image_token_id: int,
         hidden_size: int,
+        tile_size: int,
+        profile_tiles: int,
     ) -> None:
         if patch_size <= 0 or downsample_ratio != 0.5 or hidden_size <= 0:
             raise ValueError(
@@ -55,14 +59,18 @@ class NemotronNanoVLImageAdapter:
         self._downsample_factor = 2
         self._image_token_id = image_token_id
         self._hidden_size = hidden_size
+        self._tile_size = tile_size
+        self._profile_tiles = profile_tiles
 
     @classmethod
-    def from_loaded_model(cls, model: Any) -> NemotronNanoVLImageAdapter:
-        """Resolve the exact mlx-vlm v0.6.8 surface at model-load time."""
+    def from_loaded_model(
+        cls, model: Any, *, hf_config: Any = None, mm_config: Any = None
+    ) -> NemotronNanoVLImageAdapter:
+        """Resolve the pinned mlx-vlm surface and configured profiling geometry."""
         config = getattr(model, "config", None)
         language_model = getattr(model, "language_model", None)
         vision_model = getattr(model, "vision_model", None)
-        extract_feature = getattr(model, "extract_feature", None)
+        extract_feature = getattr(model, "_extract_feature_single", None)
         if (
             config is None
             or language_model is None
@@ -71,11 +79,12 @@ class NemotronNanoVLImageAdapter:
         ):
             raise RuntimeError(
                 "Nano mlx-vlm model must expose config, language_model, "
-                "vision_model, and extract_feature; loader surface changed."
+                "vision_model, and _extract_feature_single; loader surface changed."
             )
-        if not callable(getattr(language_model, "get_input_embeddings", None)):
+        backbone = getattr(language_model, "backbone", None)
+        if not callable(getattr(backbone, "embeddings", None)):
             raise RuntimeError(
-                "Nano language_model.get_input_embeddings is missing; "
+                "Nano language_model.backbone.embeddings is missing; "
                 "mlx-vlm loader surface changed."
             )
         if not hasattr(language_model, "backbone") or not hasattr(
@@ -105,10 +114,21 @@ class NemotronNanoVLImageAdapter:
             downsample_ratio = float(config.downsample_ratio)
             image_token_id = int(config.img_context_token_id)
             hidden_size = int(config.text_config.hidden_size)
+            tile_size = int(config.force_image_size)
         except (AttributeError, TypeError, ValueError) as exc:
             raise RuntimeError(
-                "Nano vision/config layout differs from pinned mlx-vlm v0.6.8."
+                "Nano vision/config layout differs from pinned mlx-vlm."
             ) from exc
+        if patch_size <= 0 or tile_size <= 0 or tile_size % (patch_size * 2):
+            raise ValueError(
+                "Nano VL V2 requires a positive, patch-aligned fixed tile size."
+            )
+        max_tiles = image_tile_limit(mm_config)
+        profile_tiles = max_tiles + int(
+            max_tiles > 1 and getattr(hf_config, "use_thumbnail", True)
+        )
+        if mm_config is not None and mm_config.get_limit_per_prompt("image") == 0:
+            profile_tiles = 0
         return cls(
             model=model,
             language_model=language_model,
@@ -116,13 +136,15 @@ class NemotronNanoVLImageAdapter:
             downsample_ratio=downsample_ratio,
             image_token_id=image_token_id,
             hidden_size=hidden_size,
+            tile_size=tile_size,
+            profile_tiles=profile_tiles,
         )
 
     def text_model(self) -> Any:
         return self._language_model
 
     def embed_tokens(self, input_ids: mx.array) -> mx.array:
-        return self._language_model.get_input_embeddings(input_ids)
+        return self._language_model.backbone.embeddings(input_ids)
 
     def get_mrope_input_positions(
         self,
@@ -184,7 +206,7 @@ class NemotronNanoVLImageAdapter:
             # Match direct mlx-vlm: preserve processor pixel precision.
             # Weight storage dtype, especially packed quantized integers,
             # does not determine the dtype of the encoder's input.
-            projected = self._model.extract_feature(pixels)
+            projected = self._model._extract_feature_single(pixels)
             if projected.ndim != 3:
                 raise ValueError(
                     f"Feature {feature.identifier!r}: Nano vision output must "
@@ -223,6 +245,34 @@ class NemotronNanoVLImageAdapter:
         # Images have already been fused by merge_multimodal_embeddings.
         # Nano has position-free attention, so it does not take position_ids.
         return self._language_model(input_ids, inputs_embeds=inputs_embeds, cache=cache)
+
+    def profile_features(self) -> list[MultiModalFeatureSpec]:
+        """Profile the configured largest image, including its optional thumbnail.
+
+        Adapted from syang-genai's PR #1160 at 96ba69519bd7c3d8ce83591fa31c33b3a29223d7.
+        Encoding is per image, so the image count does not multiply this shape.
+        """
+        if self._profile_tiles == 0:
+            return []
+        tokens_per_tile = (self._tile_size // (self._patch_size * 2)) ** 2
+        field = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
+        pixels = field.build_elems(
+            "pixel_values_flat",
+            torch.zeros(
+                (1, self._profile_tiles, 3, self._tile_size, self._tile_size),
+                dtype=torch.bfloat16,
+            ),
+        )[0]
+        return [
+            MultiModalFeatureSpec(
+                data=MultiModalKwargsItem({"pixel_values_flat": pixels}),
+                modality="image",
+                identifier="nano-vl-profile-image",
+                mm_position=PlaceholderRange(
+                    offset=0, length=self._profile_tiles * tokens_per_tile
+                ),
+            )
+        ]
 
     def _validate_feature(self, feature: MultiModalFeatureSpec) -> mx.array:
         if feature.modality != "image":
@@ -304,7 +354,8 @@ class NemotronNanoVLImageAdapter:
     @staticmethod
     def _as_mlx(value: Any) -> mx.array:
         if isinstance(value, torch.Tensor):
-            return torch_to_mlx(value)
+            # vLLM owns/caches this tensor; MLX must not donate its storage.
+            return torch_to_mlx(value, copy=True)
         if isinstance(value, mx.array):
             return value
         raise TypeError(f"Expected torch or MLX pixel tensor, got {type(value)!r}.")
