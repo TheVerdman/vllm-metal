@@ -1757,6 +1757,7 @@ def test_nano_frontend_rejects_audio_video_and_preserves_image_limit():
     from vllm.config.multimodal import MultiModalConfig
 
     config = SimpleNamespace(
+        quantization=None,
         hf_config=SimpleNamespace(
             model_type="NemotronH_Nano_VL_V2",
             architectures=["NemotronH_Nano_VL_V2"],

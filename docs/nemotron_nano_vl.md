@@ -6,12 +6,13 @@ then passes their output to the existing text runtime. Audio, video, and
 precomputed image embeddings receive validation errors. Omni support requires
 its own adapter and processor contract.
 
-The October 23 refresh targets upstream `f0812a6b679ce6afbe4cb5120d53be35ad625cc9`
+The October 26 refresh targets upstream `cac610b74b84b5b4069dab88148b7b9a49200aee`
 with MLX 0.32.4 and MLX-VLM 0.7.6. Offline adapter, loader, preprocessing,
 profiling, and hybrid-cache regressions have been rerun. Trained-checkpoint,
-HTTP, and async lifecycle validation have not been rerun on this revision
-because the local host does not meet the documented run guards. The trained
-results below remain historical evidence for the September source.
+HTTP, and async lifecycle validation remain pending on this revision. This
+refresh covers local source and offline checks; it does not recheck the host
+or start trained model runs. The trained results below remain historical
+evidence for the September source.
 
 ## Checkpoint and preprocessing
 
