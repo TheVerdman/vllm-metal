@@ -6,18 +6,17 @@ then passes their output to the existing text runtime. Audio, video, and
 precomputed image embeddings receive validation errors. Omni support requires
 its own adapter and processor contract.
 
-The October 26 refresh targets upstream `cac610b74b84b5b4069dab88148b7b9a49200aee`
-with MLX 0.32.4 and MLX-VLM 0.7.6. Offline adapter, loader, preprocessing,
-profiling, and hybrid-cache regressions have been rerun. Trained-checkpoint,
-HTTP, and async lifecycle validation remain pending on this revision. This
-refresh covers local source and offline checks; it does not recheck the host
-or start trained model runs. The trained results below remain historical
-evidence for the September source.
+The October 27 concurrency repair passes the bounded checkpoint, HTTP, and
+async lifecycle checks with MLX 0.32.4 and MLX-VLM 0.7.6. The
+[validation record below](#october-27-validation-and-concurrency-repair) pins
+the image implementation and the combined runtime source, which includes
+separate memory controls. The tested upstream base is
+`cac610b74b84b5b4069dab88148b7b9a49200aee`.
 
 ## Checkpoint and preprocessing
 
 The reference checkpoint is `ekryski/Nemotron-Nano-12B-v2-VL-4bit`, revision
-`e47ef857c31650d807610d810be199a20d9bf114`. September strict loading consumed 1,037 tensors:
+`e47ef857c31650d807610d810be199a20d9bf114`. October 27 strict loading consumed 1,037 tensors:
 641 language tensors, 389 vision tensors, and seven projector tensors. No
 checkpoint tensors are discarded and no model parameters are left unfilled.
 
@@ -78,9 +77,59 @@ the intended bounded workload. They are not a performance or headroom claim.
 The local validation harness additionally uses separately maintained explicit
 KV-byte and wired-limit controls; those changes are not part of this image patch.
 
-## Historical trained evidence and current regression checks
+## October 27 validation and concurrency repair
 
-The pinned direct reference uses MLX-VLM 0.6.8, MLX 0.32.1, and NVIDIA's
+The first October 27 run passed all eight sequential cases but changed the
+first token of the two-image request in a concurrent pair. Its prompt IDs and
+input embeddings matched the direct reference. The first differing layer was
+an attention layer: its quantized BF16 K/V projections changed when the
+request's final 51-token prefill chunk shared a larger packed step with another
+request. Subsequent recurrent layers amplified the difference. The fix projects
+Nano K/V separately for each request, preserving the standalone projection
+geometry while retaining paged attention and concurrent scheduling.
+
+Image implementation `77dc330354087357d743e571eac63a3c7a9a8735` contains the
+repair and its regression test. The actual runtime checks used combined source
+`3b7b69c817d814a7fe30cc1e7dadd19422972e70`, which includes the same image code
+plus the separately maintained explicit cache-byte and wired-memory controls.
+Those controls are not part of the image diff. The cache-byte change has since
+merged through [PR #803](https://github.com/vllm-project/vllm-metal/pull/803);
+the wired-memory option remains a local companion.
+
+| Check | Result |
+| --- | --- |
+| Strict reference | All 1,037 tensors loaded; none ignored, stripped, unconsumed, or missing |
+| Reference verification | Eight fresh capsules and their tensor inventory passed schema and self-digest checks |
+| Paged parity | Exact prompt and output IDs, including EOS, for eight sequential cases and three concurrent pairs |
+| Independent checkpoint suite | 11 passed; its fresh reference also matched all eight validated capsules |
+| Normal HTTP server | 12 checks passed; clean shutdown with exit code zero |
+| Async lifecycle | Six checks passed: abort, generator close, audio/video/image-embedding rejection with recovery, and concurrency after cancellation |
+| Focused offline suites | 157 passed on the combined source, including the real quantized K/V regression |
+
+The real-projection regression failed for both unequal prefill orders before
+the fix and passes afterward, including single-token decode rows. Targeted
+Ruff/format checks and mypy over 188 runtime files passed. The reference's
+incorrect `orange, blue` answer remains unchanged: exact token parity measures
+equivalent execution, not image-understanding quality.
+
+The machine was an Apple M5 Pro with 20 GPU cores and 64 GB memory, running
+macOS 26.6.2. Dependencies were vLLM 0.32.0+cpu, Torch 2.13.0, Transformers
+5.19.0, MLX 0.32.4, and MLX-VLM 0.7.6. The same 25 native source files and
+nine reused wheel assets were verified; this was not a native rebuild.
+
+The run retained the serving bounds above, seed zero, 32 output tokens,
+`MLX_ENABLE_TF32=1`, and `PYTORCH_ENABLE_MPS_FALLBACK=0`. The combined source
+additionally used `--kv-cache-memory-bytes 1073741824` and
+`VLLM_METAL_DISABLE_WIRED_LIMIT=1`. All five stages passed their 900-second
+process-group guards and all ten host boundaries passed with zero swap on the
+same approved boot. The scoped host exception covered only an absent historical
+panic log. An earlier diagnostic cleanup error and its passing recovery check
+remain recorded separately; no final acceptance stage had a cleanup error.
+These results do not measure projection overhead, endurance, or higher concurrency.
+
+## Historical trained evidence
+
+The September direct reference used MLX-VLM 0.6.8, MLX 0.32.1, and NVIDIA's
 independently loaded image processor on an Apple M5 Pro with 64 GB memory,
 macOS 26.6.2, and Python 3.12.12. The reference uses the loader adjustment
 described above, but does not call the Metal adapter, Metal processor, or
@@ -118,6 +167,8 @@ and all 12 HTTP checks passed again after refreshing onto upstream
 tensors and preserved every earlier prompt and output token. HTTP serving
 shut down with exit code zero. The standalone async lifecycle results above
 remain from September 14.
+
+## Reproducing the checkpoint checks
 
 The synthetic image recipes, messages, checkpoint hashes, and reference pins
 are in [`tests/fixtures/nano_vl_v2_cases.json`](../tests/fixtures/nano_vl_v2_cases.json).
